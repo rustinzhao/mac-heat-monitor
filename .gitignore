@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Local runtime output
+*.log
+*.pid
+samples.tsv
+powermetrics.log
+
+# Editor and local environment files
+.idea/
+.vscode/
+.env
