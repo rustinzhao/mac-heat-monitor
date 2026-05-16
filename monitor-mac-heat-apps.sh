@@ -22,12 +22,15 @@ LAUNCH_AGENT_FILE="$HOME/Library/LaunchAgents/$LAUNCH_AGENT_LABEL.plist"
 INTERVAL=30
 TOP_N=12
 WITH_POWERMETRICS=0
+PRIVACY_MODE="${MAC_HEAT_MONITOR_PRIVACY:-strict}"
+PRIVACY_SALT_FILE="${MAC_HEAT_MONITOR_PRIVACY_SALT_FILE:-}"
+PRIVACY_SALT=""
 
 usage() {
   cat <<'USAGE'
 Usage:
-  ./monitor-mac-heat-apps.sh once [--top N] [--with-powermetrics]
-  ./monitor-mac-heat-apps.sh start [--interval SECONDS] [--top N]
+  ./monitor-mac-heat-apps.sh once [--top N] [--privacy strict|standard] [--with-powermetrics]
+  ./monitor-mac-heat-apps.sh start [--interval SECONDS] [--top N] [--privacy strict|standard]
   ./monitor-mac-heat-apps.sh stop
   ./monitor-mac-heat-apps.sh status
   ./monitor-mac-heat-apps.sh tail
@@ -44,6 +47,10 @@ Logs:
   ~/Library/Logs/mac-heat-app-monitor/samples.tsv
 
 Notes:
+  Privacy defaults to strict. In strict mode, App and top-process labels are
+  written as stable anonymous IDs. Use --privacy standard only for local
+  troubleshooting when real App names are acceptable in logs.
+
   --with-powermetrics adds raw powermetrics samples only when the current
   process is already running as sudo/root. The LaunchAgent background mode runs
   as your user, so it uses lightweight process sampling by default.
@@ -76,6 +83,11 @@ parse_options() {
         WITH_POWERMETRICS=1
         shift
         ;;
+      --privacy)
+        [[ $# -ge 2 ]] || { echo "--privacy requires strict or standard" >&2; exit 2; }
+        PRIVACY_MODE="$2"
+        shift 2
+        ;;
       -h|--help)
         usage
         exit 0
@@ -97,6 +109,14 @@ parse_options() {
     echo "--top must be a positive integer." >&2
     exit 2
   fi
+
+  case "$PRIVACY_MODE" in
+    strict|standard) ;;
+    *)
+      echo "--privacy must be strict or standard." >&2
+      exit 2
+      ;;
+  esac
 }
 
 read_pid_value() {
@@ -131,6 +151,7 @@ write_pid_file() {
     printf 'SUMMARY_LOG=%s\n' "$SUMMARY_LOG"
     printf 'ERROR_LOG=%s\n' "$ERROR_LOG"
     printf 'SAMPLES_TSV=%s\n' "$SAMPLES_TSV"
+    printf 'PRIVACY_MODE=%s\n' "$PRIVACY_MODE"
   } > "$PID_FILE"
 }
 
@@ -164,6 +185,63 @@ launch_agent_domain() {
   printf 'gui/%s' "$(id -u)"
 }
 
+privacy_salt_path() {
+  if [[ -n "$PRIVACY_SALT_FILE" ]]; then
+    printf '%s' "$PRIVACY_SALT_FILE"
+  else
+    printf '%s/privacy-salt' "$LOG_DIR"
+  fi
+}
+
+ensure_privacy_salt() {
+  local salt_path old_umask
+  [[ "$PRIVACY_MODE" == "strict" ]] || return 0
+  [[ -n "$PRIVACY_SALT" ]] && return 0
+
+  salt_path="$(privacy_salt_path)"
+  mkdir -p "$(dirname "$salt_path")"
+  if [[ ! -s "$salt_path" ]]; then
+    old_umask="$(umask)"
+    umask 077
+    if command -v uuidgen >/dev/null 2>&1; then
+      uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]' > "$salt_path"
+    else
+      { date '+%s'; printf '%s\n' "$RANDOM"; printf '%s\n' "$$"; } | shasum -a 256 | awk '{print $1}' > "$salt_path"
+    fi
+    umask "$old_umask"
+    chmod 600 "$salt_path" >/dev/null 2>&1 || true
+  fi
+
+  PRIVACY_SALT="$(tr -d '\n\r' < "$salt_path")"
+}
+
+privacy_hash() {
+  local kind="$1"
+  local value="$2"
+
+  ensure_privacy_salt
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s:%s:%s' "$PRIVACY_SALT" "$kind" "$value" | shasum -a 256 | awk '{print substr($1, 1, 12)}'
+  else
+    printf '%s:%s:%s' "$PRIVACY_SALT" "$kind" "$value" | cksum | awk '{printf "%08x", $1}'
+  fi
+}
+
+privacy_label() {
+  local kind="$1"
+  local value="$2"
+  printf '%s-%s' "$kind" "$(privacy_hash "$kind" "$value")"
+}
+
+display_path() {
+  local value="$1"
+  if [[ "$PRIVACY_MODE" == "strict" && -n "$HOME" && "$value" == "$HOME"* ]]; then
+    printf '~%s' "${value#"$HOME"}"
+  else
+    printf '%s' "$value"
+  fi
+}
+
 write_launch_agent() {
   mkdir -p "$LOG_DIR" "$(dirname "$LAUNCH_AGENT_FILE")"
 
@@ -187,6 +265,8 @@ EOF
     plist_string "$TOP_N"
     plist_string "--log-dir"
     plist_string "$LOG_DIR"
+    plist_string "--privacy"
+    plist_string "$PRIVACY_MODE"
     if [[ "$WITH_POWERMETRICS" -eq 1 ]]; then
       plist_string "--with-powermetrics"
     fi
@@ -211,11 +291,23 @@ timestamp() {
 }
 
 load_snapshot() {
-  uptime | sed 's/^[[:space:]]*//'
+  local raw
+  raw="$(uptime | sed 's/^[[:space:]]*//')"
+  if [[ "$PRIVACY_MODE" == "strict" ]]; then
+    sed -E 's/^.*load averages?: /load averages: /' <<< "$raw"
+  else
+    printf '%s\n' "$raw"
+  fi
 }
 
 battery_snapshot() {
-  pmset -g batt 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g; s/[[:space:]]*$//' || true
+  local raw
+  raw="$(pmset -g batt 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g; s/[[:space:]]*$//' || true)"
+  if [[ "$PRIVACY_MODE" == "strict" ]]; then
+    sed -E "s/Now drawing from '[^']+'[[:space:]]*//; s/-?InternalBattery-[0-9]+[[:space:]]*//g; s/[[:space:]]*\\(id=[^)]+\\)//g; s/[[:space:]][[:space:]]*/ /g; s/^[[:space:]]*//" <<< "$raw"
+  else
+    printf '%s\n' "$raw"
+  fi
 }
 
 thermal_snapshot() {
@@ -229,7 +321,7 @@ ensure_sample_header() {
   fi
 }
 
-collect_app_rows() {
+collect_raw_app_rows() {
   ps -Aww -o pid=,ppid=,pcpu=,pmem=,rss=,command= |
     awk -v home="$HOME" '
       function app_name(cmd, first_token, app, n, pieces, base) {
@@ -309,6 +401,30 @@ collect_app_rows() {
     head -n "$TOP_N"
 }
 
+collect_app_rows() {
+  local rows app cpu mem procs pid cmd
+
+  rows="$(collect_raw_app_rows || true)"
+  [[ -n "$rows" ]] || return 0
+
+  if [[ "$PRIVACY_MODE" != "strict" ]]; then
+    printf '%s\n' "$rows"
+    return 0
+  fi
+
+  ensure_privacy_salt
+  while IFS=$'\t' read -r app cpu mem procs pid cmd; do
+    [[ -n "${app:-}" ]] || continue
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$(privacy_label app "$app")" \
+      "$cpu" \
+      "$mem" \
+      "$procs" \
+      "-" \
+      "$(privacy_label process "${cmd:-$app}")"
+  done <<< "$rows"
+}
+
 append_tsv_rows() {
   local ts="$1"
   local thermal="$2"
@@ -367,6 +483,11 @@ print_snapshot() {
 collect_powermetrics_snapshot() {
   local ts="$1"
 
+  if [[ "$PRIVACY_MODE" == "strict" ]]; then
+    printf '\nPowermetrics: skipped in strict privacy mode because raw samples may include process names. Re-run with --privacy standard --with-powermetrics only for local-only diagnostics.\n'
+    return
+  fi
+
   if ! command -v powermetrics >/dev/null 2>&1; then
     printf '\nPowermetrics: skipped, command not found.\n'
     return
@@ -413,12 +534,13 @@ start_monitor() {
   else
     echo "Requested LaunchAgent start. Check the error log if it does not appear in status shortly."
   fi
-  echo "Summary log: $SUMMARY_LOG"
-  echo "Error log: $ERROR_LOG"
-  echo "Samples TSV: $SAMPLES_TSV"
-  echo "LaunchAgent: $LAUNCH_AGENT_FILE"
-  echo "Runtime script: $RUN_SCRIPT_PATH"
-  echo "Stop it with: $SCRIPT_PATH stop"
+  echo "Privacy mode: $PRIVACY_MODE"
+  echo "Summary log: $(display_path "$SUMMARY_LOG")"
+  echo "Error log: $(display_path "$ERROR_LOG")"
+  echo "Samples TSV: $(display_path "$SAMPLES_TSV")"
+  echo "LaunchAgent: $(display_path "$LAUNCH_AGENT_FILE")"
+  echo "Runtime script: $(display_path "$RUN_SCRIPT_PATH")"
+  echo "Stop it with: $(display_path "$SCRIPT_PATH") stop"
 }
 
 stop_monitor() {
@@ -476,26 +598,34 @@ status_monitor() {
   else
     echo "Mac heat app monitor is not running."
   fi
-  echo "Summary log: $summary"
-  echo "Error log: $error_log"
-  echo "Samples TSV: $samples"
-  echo "LaunchAgent: $LAUNCH_AGENT_FILE"
+  echo "Privacy mode: $(read_file_value PRIVACY_MODE || echo "$PRIVACY_MODE")"
+  echo "Summary log: $(display_path "$summary")"
+  echo "Error log: $(display_path "$error_log")"
+  echo "Samples TSV: $(display_path "$samples")"
+  echo "LaunchAgent: $(display_path "$LAUNCH_AGENT_FILE")"
   if launchctl print "$domain/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1; then
     echo "LaunchAgent state: loaded"
   else
     echo "LaunchAgent state: not loaded"
   fi
 
-  if [[ -f "$summary" ]]; then
+  if [[ -f "$summary" && "$PRIVACY_MODE" != "strict" ]]; then
     echo
     echo "Last summary lines:"
     tail -n 30 "$summary"
+  elif [[ -f "$summary" ]]; then
+    echo
+    echo "Last summary lines hidden in strict privacy mode. Use --privacy standard only for local-only diagnostics."
   fi
 }
 
 tail_monitor() {
   local summary
   summary="$(read_file_value SUMMARY_LOG || echo "$SUMMARY_LOG")"
+  if [[ "$PRIVACY_MODE" == "strict" ]]; then
+    echo "Raw log tail is hidden in strict privacy mode. Use the dashboard for anonymized data, or restart with --privacy standard for local-only diagnostics."
+    return
+  fi
   mkdir -p "$(dirname "$summary")"
   touch "$summary"
   tail -n 80 -f "$summary"
@@ -515,7 +645,7 @@ run_loop() {
 
   trap 'cleanup; exit 0' INT TERM
 
-  printf '\n[%s] Monitor started. Interval=%ss Top=%s LogDir=%s\n' "$(timestamp)" "$INTERVAL" "$TOP_N" "$LOG_DIR"
+  printf '\n[%s] Monitor started. Interval=%ss Top=%s Privacy=%s LogDir=%s\n' "$(timestamp)" "$INTERVAL" "$TOP_N" "$PRIVACY_MODE" "$(display_path "$LOG_DIR")"
   while true; do
     print_snapshot 1
     sleep "$INTERVAL" &

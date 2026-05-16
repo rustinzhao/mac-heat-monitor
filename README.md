@@ -12,7 +12,7 @@ Mac Heat Monitor 是一组 macOS 本地脚本，用来定位“哪个 App 正在
 ## 功能
 
 - 按 App 聚合 `.app` helper 进程，而不是只看单个 PID。
-- 记录当前 top heat suspect、CPU、内存、进程数和已脱敏的 top process 标签。
+- 默认以 `strict` 隐私模式记录当前 top heat suspect、CPU、内存、进程数和已脱敏的 App/top process 标签。
 - 写入 `samples.tsv`，方便导入 Numbers、Excel、Google Sheets 或后续脚本分析。
 - 用 LaunchAgent 在当前用户登录后后台运行 monitor 和 dashboard。
 - 本地网页 dashboard 支持 CPU 趋势、Top Suspect、Last Sample、Battery、Thermal 和 Sustained Load。
@@ -82,6 +82,7 @@ http://127.0.0.1:8765
 
 - 每 30 秒采样一次。
 - 每次采样记录 Top 12 个高 CPU App。
+- 默认 `strict` 隐私模式：日志和 dashboard 使用稳定匿名标签，例如 `app-...`、`process-...`。
 - dashboard 只绑定 `127.0.0.1`，默认只允许本机访问。
 - monitor 和 dashboard 都通过当前用户的 LaunchAgent 后台运行。
 
@@ -131,7 +132,7 @@ http://127.0.0.1:8765
 
 ```bash
 ./mac-heat-dashboard.sh start
-./mac-heat-dashboard.sh start --interval 30 --top 12 --port 8765 --open
+./mac-heat-dashboard.sh start --interval 30 --top 12 --port 8765 --privacy strict --open
 ./mac-heat-dashboard.sh status
 ./mac-heat-dashboard.sh open
 ./mac-heat-dashboard.sh tail
@@ -160,6 +161,12 @@ http://127.0.0.1:8765
 
 ```bash
 ./monitor-mac-heat-apps.sh once --top 20
+```
+
+如果只在本机排查、并且你接受日志显示真实 App 名称，可以显式使用标准模式：
+
+```bash
+./monitor-mac-heat-apps.sh once --privacy standard
 ```
 
 后台启动 monitor：
@@ -205,12 +212,15 @@ Monitor 支持：
 ./monitor-mac-heat-apps.sh start \
   --interval 30 \
   --top 12 \
+  --privacy strict \
   --log-dir "$HOME/Library/Logs/mac-heat-app-monitor"
 ```
 
 环境变量：
 
 - `MAC_HEAT_MONITOR_LOG_DIR`：修改 monitor 和 dashboard 的默认日志目录。
+- `MAC_HEAT_MONITOR_PRIVACY`：隐私模式，默认 `strict`；可设为 `standard` 以保留真实 App 名称但继续隐藏命令参数。
+- `MAC_HEAT_MONITOR_PRIVACY_SALT_FILE`：严格隐私模式使用的本地 salt 文件路径。默认在日志目录下，已被 `.gitignore` 忽略。
 - `PYTHON_BIN`：指定 dashboard 使用的 Python 3。
 
 示例：
@@ -250,12 +260,12 @@ LaunchAgent：
 
 ## 怎么看 Dashboard
 
-- `Top Suspect`：当前时间窗口里平均 CPU 最高的 App。它更适合判断持续发热来源，而不是瞬间峰值。
+- `Top Suspect`：当前时间窗口里平均 CPU 最高的 App；默认显示匿名 App 标签。它更适合判断持续发热来源，而不是瞬间峰值。
 - `Last Sample`：最近一次采样时间。超过约 120 秒会显示 stale，通常说明 monitor 没在持续写入数据。
 - `Battery`：来自 `pmset -g batt` 的电池状态摘要。
 - `Thermal`：来自 `pmset -g therm` 的 thermal pressure 摘要。
-- `CPU Trend`：展示高 CPU App 在选定时间窗口中的趋势。
-- `Sustained Load`：按平均 CPU 和最大 CPU 排名的 App 列表。
+- `CPU Trend`：展示高 CPU App 或匿名 App 标签在选定时间窗口中的趋势。
+- `Sustained Load`：按平均 CPU 和最大 CPU 排名的 App 或匿名 App 标签列表。
 
 重要限制：macOS 不提供完美的“每个 App 对机身温度贡献值”。这个工具使用持续 CPU、进程聚合、系统 thermal 和电池状态来推断发热嫌疑对象。
 
@@ -276,6 +286,8 @@ top_pid
 top_command
 ```
 
+默认 `strict` 模式下，`app` 和 `top_command` 字段写入的是稳定匿名标签，`top_pid` 写入 `-`，不包含真实 App 名称、命令参数、用户目录或进程 PID。匿名标签由本地 `privacy-salt` 生成；不要提交这个 salt 文件，否则会降低匿名性。
+
 查看 TSV：
 
 ```bash
@@ -290,10 +302,10 @@ tail -n 200 ~/Library/Logs/mac-heat-app-monitor/samples.tsv > /tmp/mac-heat-rece
 
 ## 使用 powermetrics
 
-`powermetrics` 可以给一次性采样增加更底层的 CPU/GPU/thermal 原始输出，但它需要 root 权限。
+`powermetrics` 可以给一次性采样增加更底层的 CPU/GPU/thermal 原始输出，但它需要 root 权限，并且原始输出可能包含进程名称。严格隐私模式会跳过这部分原始采样。
 
 ```bash
-sudo ./monitor-mac-heat-apps.sh once --with-powermetrics
+sudo ./monitor-mac-heat-apps.sh once --privacy standard --with-powermetrics
 ```
 
 输出会追加到：
@@ -383,8 +395,10 @@ launchctl print "gui/$(id -u)/com.local.mac-heat-dashboard"
 ## 隐私和安全
 
 - Dashboard 默认只监听 `127.0.0.1`，不对局域网开放。
-- 日志会包含 App 名称、已脱敏的进程标签、电池状态和系统负载。
+- 默认 `strict` 隐私模式会匿名化 App 名称和 top process 标签，并把系统负载、电池状态摘要化，避免写入用户目录、命令参数、本机电池 ID 和真实进程标签。
+- `standard` 隐私模式会保留真实 App 名称，但仍会隐藏命令参数并把用户目录显示为 `~`；只建议本机临时排查使用。
 - 不要把自己的 `~/Library/Logs/mac-heat-app-monitor` 日志提交到公开仓库。
+- 不要提交 `privacy-salt`、`.env`、日志、PID、plist、key/pem 等本地文件；这些类型已写入 `.gitignore`。
 - 如果把 `--host` 改成 `0.0.0.0`，dashboard 可能被同一网络的其他设备访问，请自行配置防火墙和访问控制。
 
 ## 开发和验证

@@ -33,11 +33,12 @@ TOP_N="12"
 START_MONITOR=1
 OPEN_BROWSER=0
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || true)}"
+PRIVACY_MODE="${MAC_HEAT_MONITOR_PRIVACY:-strict}"
 
 usage() {
   cat <<'USAGE'
 Usage:
-  ./mac-heat-dashboard.sh start [--interval SECONDS] [--top N] [--port PORT] [--open]
+  ./mac-heat-dashboard.sh start [--interval SECONDS] [--top N] [--port PORT] [--privacy strict|standard] [--open]
   ./mac-heat-dashboard.sh stop
   ./mac-heat-dashboard.sh stop-all
   ./mac-heat-dashboard.sh status
@@ -51,6 +52,10 @@ What it does:
 Logs:
   ~/Library/Logs/mac-heat-app-monitor/dashboard.log
   ~/Library/Logs/mac-heat-app-monitor/dashboard-error.log
+
+Privacy:
+  Privacy defaults to strict. In strict mode, App and top-process labels are
+  anonymous in monitor logs and dashboard responses.
 USAGE
 }
 
@@ -85,6 +90,11 @@ parse_options() {
         OPEN_BROWSER=1
         shift
         ;;
+      --privacy)
+        [[ $# -ge 2 ]] || { echo "--privacy requires strict or standard" >&2; exit 2; }
+        PRIVACY_MODE="$2"
+        shift 2
+        ;;
       -h|--help)
         usage
         exit 0
@@ -111,6 +121,14 @@ parse_options() {
     echo "--port must be an integer from 1 to 65535." >&2
     exit 2
   fi
+
+  case "$PRIVACY_MODE" in
+    strict|standard) ;;
+    *)
+      echo "--privacy must be strict or standard." >&2
+      exit 2
+      ;;
+  esac
 }
 
 read_pid() {
@@ -138,6 +156,23 @@ plist_string() {
 
 launch_agent_domain() {
   printf 'gui/%s' "$(id -u)"
+}
+
+privacy_salt_path() {
+  if [[ -n "${MAC_HEAT_MONITOR_PRIVACY_SALT_FILE:-}" ]]; then
+    printf '%s' "$MAC_HEAT_MONITOR_PRIVACY_SALT_FILE"
+  else
+    printf '%s/privacy-salt' "$LOG_DIR"
+  fi
+}
+
+display_path() {
+  local value="$1"
+  if [[ "$PRIVACY_MODE" == "strict" && -n "$HOME" && "$value" == "$HOME"* ]]; then
+    printf '~%s' "${value#"$HOME"}"
+  else
+    printf '%s' "$value"
+  fi
 }
 
 install_runtime_files() {
@@ -193,6 +228,10 @@ EOF
     plist_string "$DASHBOARD_PID_FILE"
     plist_string "--monitor-label"
     plist_string "$MONITOR_LABEL"
+    plist_string "--privacy"
+    plist_string "$PRIVACY_MODE"
+    plist_string "--privacy-salt-file"
+    plist_string "$(privacy_salt_path)"
     cat <<EOF
   </array>
   <key>RunAtLoad</key>
@@ -219,7 +258,7 @@ start_dashboard() {
   install_runtime_files
 
   if [[ "$START_MONITOR" -eq 1 ]]; then
-    "$MONITOR_SCRIPT" start --interval "$INTERVAL" --top "$TOP_N"
+    "$MONITOR_SCRIPT" start --interval "$INTERVAL" --top "$TOP_N" --privacy "$PRIVACY_MODE"
   fi
 
   write_launch_agent
@@ -235,10 +274,11 @@ start_dashboard() {
   else
     echo "Requested dashboard start. Check the error log if it does not appear in status shortly."
   fi
+  echo "Privacy mode: $PRIVACY_MODE"
   echo "Dashboard URL: $(dashboard_url)"
-  echo "LaunchAgent: $LAUNCH_AGENT_FILE"
-  echo "Dashboard log: $DASHBOARD_LOG"
-  echo "Dashboard error log: $DASHBOARD_ERROR_LOG"
+  echo "LaunchAgent: $(display_path "$LAUNCH_AGENT_FILE")"
+  echo "Dashboard log: $(display_path "$DASHBOARD_LOG")"
+  echo "Dashboard error log: $(display_path "$DASHBOARD_ERROR_LOG")"
 
   if [[ "$OPEN_BROWSER" -eq 1 ]]; then
     open "$(dashboard_url)"
@@ -285,10 +325,11 @@ status_dashboard() {
   else
     echo "Mac heat dashboard is not running."
   fi
+  echo "Privacy mode: $PRIVACY_MODE"
   echo "Dashboard URL: $(dashboard_url)"
-  echo "Dashboard log: $DASHBOARD_LOG"
-  echo "Dashboard error log: $DASHBOARD_ERROR_LOG"
-  echo "LaunchAgent: $LAUNCH_AGENT_FILE"
+  echo "Dashboard log: $(display_path "$DASHBOARD_LOG")"
+  echo "Dashboard error log: $(display_path "$DASHBOARD_ERROR_LOG")"
+  echo "LaunchAgent: $(display_path "$LAUNCH_AGENT_FILE")"
 
   if launchctl print "$domain/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1; then
     echo "LaunchAgent state: loaded"

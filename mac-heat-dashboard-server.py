@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import hashlib
 import json
 import os
 import re
+import secrets
 import signal
 import subprocess
 import threading
@@ -687,6 +689,31 @@ def parse_ts(value):
         return None
 
 
+def load_privacy_salt(path):
+    salt_path = Path(path).expanduser()
+    salt_path.parent.mkdir(parents=True, exist_ok=True)
+    if salt_path.exists():
+        salt = salt_path.read_text(encoding="utf-8", errors="replace").strip()
+        if salt:
+            return salt
+
+    salt = secrets.token_hex(16)
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_EXCL if not salt_path.exists() else os.O_TRUNC)
+    fd = os.open(str(salt_path), flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(salt)
+    return salt
+
+
+def privacy_label(kind, value, salt):
+    if not value:
+        return ""
+    if re.fullmatch(rf"{kind}-[0-9a-f]{{8,64}}", value):
+        return value
+    digest = hashlib.sha256(f"{salt}:{kind}:{value}".encode("utf-8", errors="replace")).hexdigest()
+    return f"{kind}-{digest[:12]}"
+
+
 def sanitize_command(command):
     command = (command or "").strip()
     if not command:
@@ -706,6 +733,20 @@ def sanitize_command(command):
     return value
 
 
+def sanitize_battery(text):
+    text = re.sub(r"Now drawing from '[^']+'\s*", "", text or "")
+    text = re.sub(r"-?InternalBattery-\d+\s*", "", text)
+    text = re.sub(r"\s*\(id=[^)]+\)", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def sanitize_load(text):
+    match = re.search(r"load averages?:\s*(.*)", text or "", re.IGNORECASE)
+    if match:
+        return f"load averages: {match.group(1).strip()}"
+    return text or ""
+
+
 def read_tail_lines(path, max_lines=25000):
     sample_path = Path(path).expanduser()
     if not sample_path.exists():
@@ -714,7 +755,7 @@ def read_tail_lines(path, max_lines=25000):
         return list(deque(handle, maxlen=max_lines))
 
 
-def read_samples(path, minutes):
+def read_samples(path, minutes, privacy="strict", privacy_salt=""):
     lines = read_tail_lines(path)
     if not lines:
         return []
@@ -750,19 +791,32 @@ def read_samples(path, minutes):
         except ValueError:
             process_count = 0
 
+        thermal = row[1]
+        battery = row[2]
+        load = row[3]
+        app = row[4]
+        top_pid = row[8]
+        top_command = sanitize_command(row[9])
+        if privacy == "strict":
+            battery = sanitize_battery(battery)
+            load = sanitize_load(load)
+            app = privacy_label("app", app, privacy_salt)
+            top_pid = "-"
+            top_command = privacy_label("process", top_command or row[4], privacy_salt)
+
         rows.append(
             {
                 "timestamp": row[0],
                 "epoch_ms": int(epoch * 1000) if epoch else None,
-                "thermal": row[1],
-                "battery": row[2],
-                "load": row[3],
-                "app": row[4],
+                "thermal": thermal,
+                "battery": battery,
+                "load": load,
+                "app": app,
                 "cpu_percent": cpu,
                 "memory_mb": memory,
                 "process_count": process_count,
-                "top_pid": row[8],
-                "top_command": sanitize_command(row[9]),
+                "top_pid": top_pid,
+                "top_command": top_command,
             }
         )
     return rows
@@ -823,7 +877,7 @@ def monitor_state(pid_file, label):
 
 
 def build_overview(config, minutes, limit):
-    samples = read_samples(config.samples, minutes)
+    samples = read_samples(config.samples, minutes, config.privacy, config.privacy_salt)
     latest_ts = None
     latest_rows = []
     if samples:
@@ -913,6 +967,7 @@ def build_overview(config, minutes, limit):
         "top_apps": top_apps,
         "series": series,
         "max_cpu": round(max_cpu, 2),
+        "privacy": config.privacy,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -946,6 +1001,12 @@ class Handler(BaseHTTPRequestHandler):
             self.write_json(build_overview(self.server.config, minutes, limit))
             return
         if parsed.path == "/api/logs":
+            if self.server.config.privacy == "strict":
+                self.write_bytes(
+                    b"Log tail is hidden in strict privacy mode. Restart with --privacy standard for local-only diagnostics.\n",
+                    "text/plain; charset=utf-8",
+                )
+                return
             log_type = params.get("type", ["summary"])[0]
             path = self.server.config.error_log if log_type == "error" else self.server.config.summary_log
             lines = self.int_param(params, "lines", 120, 1, 1000)
@@ -1001,7 +1062,13 @@ def main():
     parser.add_argument("--monitor-pid-file", default=os.path.join(os.environ.get("TMPDIR", "/tmp"), "mac-heat-app-monitor.pid"))
     parser.add_argument("--dashboard-pid-file", default=os.path.expanduser("~/Library/Application Support/mac-heat-app-monitor/dashboard.pid"))
     parser.add_argument("--monitor-label", default="com.local.mac-heat-app-monitor")
+    parser.add_argument("--privacy", choices=("strict", "standard"), default=os.environ.get("MAC_HEAT_MONITOR_PRIVACY", "strict"))
+    parser.add_argument("--privacy-salt-file", default=os.environ.get("MAC_HEAT_MONITOR_PRIVACY_SALT_FILE", ""))
     args = parser.parse_args()
+
+    if not args.privacy_salt_file:
+        args.privacy_salt_file = str(Path(args.samples).expanduser().parent / "privacy-salt")
+    args.privacy_salt = load_privacy_salt(args.privacy_salt_file) if args.privacy == "strict" else ""
 
     write_pid(args.dashboard_pid_file)
 

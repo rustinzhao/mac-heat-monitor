@@ -5,10 +5,21 @@ __pycache__/
 # Local runtime output
 *.log
 *.pid
+*.plist
 samples.tsv
 powermetrics.log
+privacy-salt*
 
 # Editor and local environment files
 .idea/
 .vscode/
 .env
+.env.*
+
+# Private credentials and local machine material
+*.key
+*.pem
+*.p12
+*.mobileprovision
+id_rsa*
+id_ed25519*
